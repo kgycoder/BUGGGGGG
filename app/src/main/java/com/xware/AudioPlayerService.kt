@@ -3,29 +3,26 @@ package com.xware
 import android.app.*
 import android.content.Context
 import android.content.Intent
+import android.media.AudioAttributes
+import android.media.MediaPlayer
 import android.os.*
 import androidx.core.app.NotificationCompat
-import androidx.media3.common.MediaItem
-import androidx.media3.common.Player
-import androidx.media3.exoplayer.ExoPlayer
 import kotlinx.coroutines.*
 
 class AudioPlayerService : Service() {
 
-    private var player: ExoPlayer? = null
+    private var player: MediaPlayer? = null
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private val extractor = YouTubeExtractor()
-    private val handler = Handler(Looper.getMainLooper())
-
     private var currentVideoId: String? = null
     private var currentTitle: String = ""
+    private var tickJob: Job? = null
+    private var duration: Double = 0.0
 
     var onStateChanged: ((state: String) -> Unit)? = null
     var onTimeUpdate: ((cur: Double, dur: Double) -> Unit)? = null
     var onError: ((code: Int) -> Unit)? = null
     var onReady: (() -> Unit)? = null
-
-    private var tickJob: Job? = null
 
     companion object {
         const val ACTION_LOAD    = "com.xware.PLAYER_LOAD"
@@ -48,33 +45,7 @@ class AudioPlayerService : Service() {
         super.onCreate()
         instance = this
         createNotificationChannel()
-        initPlayer()
         startForeground(NOTIF_ID, buildNotification())
-    }
-
-    private fun initPlayer() {
-        player = ExoPlayer.Builder(this).build().apply {
-            addListener(object : Player.Listener {
-                override fun onPlaybackStateChanged(state: Int) {
-                    when (state) {
-                        Player.STATE_READY    -> { onReady?.invoke(); onStateChanged?.invoke("ready"); startTick() }
-                        Player.STATE_ENDED    -> { onStateChanged?.invoke("ended"); stopTick() }
-                        Player.STATE_BUFFERING -> onStateChanged?.invoke("buffering")
-                        Player.STATE_IDLE      -> onStateChanged?.invoke("idle")
-                    }
-                }
-                override fun onIsPlayingChanged(isPlaying: Boolean) {
-                    onStateChanged?.invoke(if (isPlaying) "playing" else "paused")
-                    if (isPlaying) startTick() else stopTick()
-                    updateNotification()
-                }
-                override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
-                    android.util.Log.e("XWare/Player", "ExoPlayer error: ${error.message}")
-                    onError?.invoke(error.errorCode)
-                    stopTick()
-                }
-            })
-        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -83,18 +54,18 @@ class AudioPlayerService : Service() {
                 val vid = intent.getStringExtra(EXTRA_VIDEO_ID) ?: return START_STICKY
                 loadVideo(vid)
             }
-            ACTION_PLAY  -> player?.play()
-            ACTION_PAUSE -> player?.pause()
+            ACTION_PLAY  -> resumePlay()
+            ACTION_PAUSE -> pausePlay()
             ACTION_SEEK  -> {
-                val ms = intent.getLongExtra(EXTRA_SEEK_MS, 0L)
-                player?.seekTo(ms)
+                val ms = intent.getLongExtra(EXTRA_SEEK_MS, 0L).toInt()
+                try { player?.seekTo(ms) } catch (e: Exception) {}
             }
             ACTION_VOL   -> {
                 val vol = intent.getFloatExtra(EXTRA_VOLUME, 1f)
-                player?.volume = vol
+                try { player?.setVolume(vol, vol) } catch (e: Exception) {}
             }
             ACTION_STOP  -> {
-                stopTick(); player?.stop()
+                stopTick(); releasePlayer()
                 stopForeground(true); stopSelf()
             }
         }
@@ -102,9 +73,6 @@ class AudioPlayerService : Service() {
     }
 
     private fun loadVideo(videoId: String) {
-        if (videoId == currentVideoId && player?.playbackState == Player.STATE_READY) {
-            player?.seekTo(0); player?.play(); return
-        }
         currentVideoId = videoId
         onStateChanged?.invoke("buffering")
 
@@ -116,14 +84,39 @@ class AudioPlayerService : Service() {
                     return@launch
                 }
                 currentTitle = info.title
+                duration = info.duration.toDouble()
+
                 withContext(Dispatchers.Main) {
-                    player?.apply {
-                        stop()
-                        setMediaItem(MediaItem.fromUri(info.audioUrl))
-                        prepare()
-                        play()
+                    releasePlayer()
+                    player = MediaPlayer().apply {
+                        setAudioAttributes(
+                            AudioAttributes.Builder()
+                                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                                .setUsage(AudioAttributes.USAGE_MEDIA)
+                                .build()
+                        )
+                        setDataSource(info.audioUrl)
+                        setOnPreparedListener { mp ->
+                            duration = mp.duration / 1000.0
+                            onReady?.invoke()
+                            onStateChanged?.invoke("ready")
+                            mp.start()
+                            onStateChanged?.invoke("playing")
+                            startTick()
+                            updateNotification()
+                        }
+                        setOnCompletionListener {
+                            onStateChanged?.invoke("ended")
+                            stopTick()
+                        }
+                        setOnErrorListener { _, what, extra ->
+                            android.util.Log.e("XWare/Player", "MediaPlayer error: $what / $extra")
+                            onError?.invoke(what)
+                            stopTick()
+                            true
+                        }
+                        prepareAsync()
                     }
-                    updateNotification()
                 }
             } catch (e: Exception) {
                 android.util.Log.e("XWare/Player", "loadVideo failed: ${e.message}")
@@ -132,16 +125,41 @@ class AudioPlayerService : Service() {
         }
     }
 
+    private fun resumePlay() {
+        try {
+            player?.start()
+            onStateChanged?.invoke("playing")
+            startTick()
+            updateNotification()
+        } catch (e: Exception) {}
+    }
+
+    private fun pausePlay() {
+        try {
+            player?.pause()
+            onStateChanged?.invoke("paused")
+            stopTick()
+            updateNotification()
+        } catch (e: Exception) {}
+    }
+
+    private fun releasePlayer() {
+        try { player?.stop() } catch (e: Exception) {}
+        try { player?.release() } catch (e: Exception) {}
+        player = null
+    }
+
     private fun startTick() {
         stopTick()
         tickJob = scope.launch {
             while (isActive) {
-                val p = player ?: break
-                if (p.isPlaying) {
-                    val cur = p.currentPosition / 1000.0
-                    val dur = p.duration.let { if (it < 0) 0.0 else it / 1000.0 }
-                    onTimeUpdate?.invoke(cur, dur)
-                }
+                try {
+                    val p = player
+                    if (p != null && p.isPlaying) {
+                        val cur = p.currentPosition / 1000.0
+                        onTimeUpdate?.invoke(cur, duration)
+                    }
+                } catch (e: Exception) {}
                 delay(250)
             }
         }
@@ -149,10 +167,10 @@ class AudioPlayerService : Service() {
 
     private fun stopTick() { tickJob?.cancel(); tickJob = null }
 
-    fun getCurrentTime(): Double = (player?.currentPosition ?: 0L) / 1000.0
-    fun getDuration(): Double { val d = player?.duration ?: 0L; return if (d < 0) 0.0 else d / 1000.0 }
-    fun isPlaying(): Boolean = player?.isPlaying ?: false
-    fun setVolume(vol: Float) { player?.volume = vol }
+    fun getCurrentTime(): Double = try { (player?.currentPosition ?: 0) / 1000.0 } catch (e: Exception) { 0.0 }
+    fun getDuration(): Double = duration
+    fun isPlaying(): Boolean = try { player?.isPlaying ?: false } catch (e: Exception) { false }
+    fun setVolume(vol: Float) { try { player?.setVolume(vol, vol) } catch (e: Exception) {} }
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -163,17 +181,10 @@ class AudioPlayerService : Service() {
     }
 
     private fun buildNotification(): Notification {
-        val pi = PendingIntent.getService(this, 0,
-            Intent(this, AudioPlayerService::class.java).apply {
-                action = if (player?.isPlaying == true) ACTION_PAUSE else ACTION_PLAY
-            }, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("X-WARE")
             .setContentText(currentTitle.ifEmpty { "재생 중..." })
             .setSmallIcon(android.R.drawable.ic_media_play)
-            .addAction(android.R.drawable.ic_media_pause,
-                if (player?.isPlaying == true) "일시정지" else "재생", pi)
             .setOngoing(true)
             .build()
     }
@@ -182,24 +193,14 @@ class AudioPlayerService : Service() {
         try {
             (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
                 .notify(NOTIF_ID, buildNotification())
-        } catch (e: Exception) { }
+        } catch (e: Exception) {}
     }
 
     override fun onDestroy() {
-        instance = null; stopTick(); scope.cancel()
-        player?.release(); player = null
+        instance = null
+        stopTick()
+        scope.cancel()
+        releasePlayer()
         super.onDestroy()
     }
 }
-```
-
-또한 `gradle/libs.versions.toml`에서 `media3-session` 의존성도 제거해야 합니다. 해당 파일을 열고 아래 두 줄을 삭제하세요:
-```
-# 이 줄 삭제
-media3-session = { group = "androidx.media3", name = "media3-session", version.ref = "media3" }
-```
-
-그리고 `app/build.gradle.kts`에서도:
-```
-# 이 줄 삭제
-implementation(libs.media3.session)
